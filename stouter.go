@@ -182,8 +182,9 @@ func (p *Provider) poll(ctx context.Context, cfgChan chan<- json.Marshaler) {
 			cfg := buildDynamicConfig(services, p.ruleTpl, p.entryPoints)
 			hash := hashConfig(cfg)
 			if hash != lastHash {
+				var msg json.Marshaler = cfg
 				select {
-				case cfgChan <- cfg:
+				case cfgChan <- msg:
 					lastHash = hash
 				case <-ctx.Done():
 					return
