@@ -79,11 +79,16 @@ type HTTPConfig struct {
 	Services map[string]*Service `json:"services,omitempty"`
 }
 
+// RouterTLS holds TLS configuration for a router.
+type RouterTLS struct {
+}
+
 // Router is a Traefik HTTP router.
 type Router struct {
-	Rule        string   `json:"rule"`
-	Service     string   `json:"service"`
-	EntryPoints []string `json:"entryPoints,omitempty"`
+	Rule        string     `json:"rule"`
+	Service     string     `json:"service"`
+	EntryPoints []string   `json:"entryPoints,omitempty"`
+	TLS         *RouterTLS `json:"tls,omitempty"`
 }
 
 // Service is a Traefik HTTP service with a load balancer.
@@ -264,6 +269,7 @@ func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, e
 			Rule:        rule,
 			Service:     key,
 			EntryPoints: entryPoints,
+			TLS:         &RouterTLS{},
 		}
 
 		svcMap[key] = &Service{
