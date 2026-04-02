@@ -1,13 +1,13 @@
 package traefik_plugin_stouter
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"text/template"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ func TestFetchServices(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	services, err := fetchServices(srv.URL)
+	services, err := fetchServices(http.DefaultClient, srv.URL)
 	if err != nil {
 		t.Fatalf("fetchServices: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestFetchServicesHTTPError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := fetchServices(srv.URL)
+	_, err := fetchServices(http.DefaultClient, srv.URL)
 	if err == nil {
 		t.Fatal("expected error for 500 response")
 	}
@@ -81,7 +81,7 @@ func TestFetchServicesInvalidJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := fetchServices(srv.URL)
+	_, err := fetchServices(http.DefaultClient, srv.URL)
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -340,11 +340,105 @@ func TestProvideIntegration(t *testing.T) {
 	// just verify the no-duplicate path above.)
 }
 
-// Verify hashConfig returns the zero hash for nil input gracefully.
+// ---------------------------------------------------------------------------
+// buildDynamicConfig with custom domains
+// ---------------------------------------------------------------------------
+
+func TestBuildDynamicConfigCustomDomains(t *testing.T) {
+	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
+	entryPoints := []string{"websecure"}
+
+	services := []StouterService{
+		{Name: "equipflo-test-web", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"equipflo.com", "www.equipflo.com"}},
+	}
+
+	cfg := buildDynamicConfig(services, tpl, entryPoints)
+
+	r, ok := cfg.HTTP.Routers["stouter-equipflo-test-web"]
+	if !ok {
+		t.Fatal("missing router stouter-equipflo-test-web")
+	}
+	want := "Host(`equipflo.com`) || Host(`www.equipflo.com`)"
+	if r.Rule != want {
+		t.Errorf("rule = %q, want %q", r.Rule, want)
+	}
+}
+
+func TestBuildDynamicConfigSingleCustomDomain(t *testing.T) {
+	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
+
+	services := []StouterService{
+		{Name: "web", Port: 8080, Address: "127.0.0.1:8080", Domains: []string{"example.com"}},
+	}
+
+	cfg := buildDynamicConfig(services, tpl, []string{"web"})
+
+	r := cfg.HTTP.Routers["stouter-web"]
+	if r.Rule != "Host(`example.com`)" {
+		t.Errorf("rule = %q", r.Rule)
+	}
+}
+
+func TestBuildDynamicConfigMixedDomainsAndTemplate(t *testing.T) {
+	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
+	entryPoints := []string{"web"}
+
+	services := []StouterService{
+		{Name: "with-domains", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"custom.com"}},
+		{Name: "no-domains", Port: 8080, Address: "127.0.0.1:8080"},
+	}
+
+	cfg := buildDynamicConfig(services, tpl, entryPoints)
+
+	// Service with domains should use Host() rule.
+	r1 := cfg.HTTP.Routers["stouter-with-domains"]
+	if r1.Rule != "Host(`custom.com`)" {
+		t.Errorf("with-domains rule = %q, want Host(`custom.com`)", r1.Rule)
+	}
+
+	// Service without domains should fall back to template.
+	r2 := cfg.HTTP.Routers["stouter-no-domains"]
+	if r2.Rule != "Host(`no-domains.stouter.local`)" {
+		t.Errorf("no-domains rule = %q, want Host(`no-domains.stouter.local`)", r2.Rule)
+	}
+}
+
+func TestFetchServicesWithDomains(t *testing.T) {
+	body := `[{"name":"web","port":8080,"address":"127.0.0.1:8080","domains":["example.com","www.example.com"]}]`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	services, err := fetchServices(http.DefaultClient, srv.URL)
+	if err != nil {
+		t.Fatalf("fetchServices: %v", err)
+	}
+	if len(services) != 1 {
+		t.Fatalf("got %d services, want 1", len(services))
+	}
+	if len(services[0].Domains) != 2 {
+		t.Fatalf("got %d domains, want 2", len(services[0].Domains))
+	}
+	if services[0].Domains[0] != "example.com" || services[0].Domains[1] != "www.example.com" {
+		t.Errorf("domains = %v", services[0].Domains)
+	}
+}
+
+// Verify hashConfig returns a stable value for nil input.
 func TestHashConfigNil(t *testing.T) {
 	h := hashConfig(nil)
-	if h == ([sha256.Size]byte{}) {
-		// json.Marshal(nil) → "null", so hash should be non-zero.
-		t.Error("expected non-zero hash for nil config")
+	if h == "" {
+		t.Error("expected non-empty hash for nil config")
+	}
+	// Should be deterministic.
+	if h != hashConfig(nil) {
+		t.Error("nil hash is not stable")
 	}
 }

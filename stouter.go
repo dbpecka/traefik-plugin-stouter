@@ -6,12 +6,14 @@ package traefik_plugin_stouter
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
+	"sync"
 	"text/template"
 	"time"
 )
@@ -44,9 +46,10 @@ func CreateConfig() *Config {
 
 // StouterService represents a single service returned by the stouter API.
 type StouterService struct {
-	Name    string `json:"name"`
-	Port    int    `json:"port"`
-	Address string `json:"address"`
+	Name    string   `json:"name"`
+	Port    int      `json:"port"`
+	Address string   `json:"address"`
+	Domains []string `json:"domains"`
 }
 
 // ---------------------------------------------------------------------------
@@ -58,8 +61,8 @@ type DynConfig struct {
 	HTTP *HTTPConfig `json:"http,omitempty"`
 }
 
-// MarshalJSON implements json.Marshaler so DynConfig satisfies the channel type
-// expected by Traefik's Provide method.
+// MarshalJSON implements json.Marshaler so *DynConfig satisfies the channel
+// type (chan<- json.Marshaler) required by Traefik's Provide method.
 func (d *DynConfig) MarshalJSON() ([]byte, error) {
 	type Alias DynConfig
 	return json.Marshal((*Alias)(d))
@@ -104,7 +107,10 @@ type Provider struct {
 	endpoint     string
 	ruleTpl      *template.Template
 	entryPoints  []string
-	cancel       context.CancelFunc
+	httpClient   *http.Client
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
 }
 
 // New creates a new Provider from the supplied config.
@@ -125,6 +131,9 @@ func New(_ context.Context, config *Config, name string) (*Provider, error) {
 		endpoint:     config.Endpoint,
 		ruleTpl:      tpl,
 		entryPoints:  config.DefaultEntryPoints,
+		httpClient: &http.Client{
+			Timeout: d - d/10, // 90% of poll interval
+		},
 	}, nil
 }
 
@@ -137,7 +146,10 @@ func (p *Provider) Init() error {
 // cfgChan whenever the set of stouter services changes.
 func (p *Provider) Provide(cfgChan chan<- json.Marshaler) error {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	p.mu.Lock()
 	p.cancel = cancel
+	p.mu.Unlock()
 
 	go p.poll(ctx, cfgChan)
 	return nil
@@ -145,8 +157,12 @@ func (p *Provider) Provide(cfgChan chan<- json.Marshaler) error {
 
 // Stop signals the polling goroutine to exit.
 func (p *Provider) Stop() error {
-	if p.cancel != nil {
-		p.cancel()
+	p.mu.Lock()
+	cancel := p.cancel
+	p.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
 	return nil
 }
@@ -155,19 +171,23 @@ func (p *Provider) poll(ctx context.Context, cfgChan chan<- json.Marshaler) {
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 
-	var lastHash [sha256.Size]byte
+	var lastHash string
 
 	// Poll immediately on start, then on each tick.
 	for {
-		services, err := fetchServices(p.endpoint)
+		services, err := fetchServices(p.httpClient, p.endpoint)
 		if err != nil {
 			log.Printf("[stouter] failed to fetch services: %v", err)
 		} else {
 			cfg := buildDynamicConfig(services, p.ruleTpl, p.entryPoints)
 			hash := hashConfig(cfg)
 			if hash != lastHash {
-				cfgChan <- cfg
-				lastHash = hash
+				select {
+				case cfgChan <- cfg:
+					lastHash = hash
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 
@@ -185,8 +205,8 @@ func (p *Provider) poll(ctx context.Context, cfgChan chan<- json.Marshaler) {
 
 // fetchServices performs a GET to the stouter /services endpoint and returns
 // the parsed service list.
-func fetchServices(endpoint string) ([]StouterService, error) {
-	resp, err := http.Get(endpoint + "/services")
+func fetchServices(client *http.Client, endpoint string) ([]StouterService, error) {
+	resp, err := client.Get(endpoint + "/services")
 	if err != nil {
 		return nil, fmt.Errorf("HTTP GET: %w", err)
 	}
@@ -218,14 +238,24 @@ func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, e
 	for _, svc := range services {
 		key := "stouter-" + svc.Name
 
-		var ruleBuf bytes.Buffer
-		if err := ruleTpl.Execute(&ruleBuf, svc); err != nil {
-			log.Printf("[stouter] rule template error for %q: %v", svc.Name, err)
-			continue
+		var rule string
+		if len(svc.Domains) > 0 {
+			parts := make([]string, len(svc.Domains))
+			for i, d := range svc.Domains {
+				parts[i] = fmt.Sprintf("Host(`%s`)", d)
+			}
+			rule = strings.Join(parts, " || ")
+		} else {
+			var ruleBuf bytes.Buffer
+			if err := ruleTpl.Execute(&ruleBuf, svc); err != nil {
+				log.Printf("[stouter] rule template error for %q: %v", svc.Name, err)
+				continue
+			}
+			rule = ruleBuf.String()
 		}
 
 		routers[key] = &Router{
-			Rule:        ruleBuf.String(),
+			Rule:        rule,
 			Service:     key,
 			EntryPoints: entryPoints,
 		}
@@ -247,9 +277,53 @@ func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, e
 	}
 }
 
-// hashConfig returns a SHA-256 hash of the JSON-serialised config, used for
-// change detection so we only push updates when something actually changed.
-func hashConfig(cfg *DynConfig) [sha256.Size]byte {
-	data, _ := json.Marshal(cfg)
-	return sha256.Sum256(data)
+// canonicalJSON returns a deterministic JSON representation of cfg by sorting
+// map keys, so the output is stable across calls regardless of Go's random map
+// iteration order.
+func canonicalJSON(cfg *DynConfig) []byte {
+	if cfg == nil || cfg.HTTP == nil {
+		return []byte("{}")
+	}
+
+	type canonicalEntry struct {
+		Key     string   `json:"key"`
+		Router  *Router  `json:"router,omitempty"`
+		Service *Service `json:"service,omitempty"`
+	}
+
+	routerKeys := make([]string, 0, len(cfg.HTTP.Routers))
+	for k := range cfg.HTTP.Routers {
+		routerKeys = append(routerKeys, k)
+	}
+	sort.Strings(routerKeys)
+
+	serviceKeys := make([]string, 0, len(cfg.HTTP.Services))
+	for k := range cfg.HTTP.Services {
+		serviceKeys = append(serviceKeys, k)
+	}
+	sort.Strings(serviceKeys)
+
+	routers := make([]canonicalEntry, len(routerKeys))
+	for i, k := range routerKeys {
+		routers[i] = canonicalEntry{Key: k, Router: cfg.HTTP.Routers[k]}
+	}
+
+	services := make([]canonicalEntry, len(serviceKeys))
+	for i, k := range serviceKeys {
+		services[i] = canonicalEntry{Key: k, Service: cfg.HTTP.Services[k]}
+	}
+
+	out := struct {
+		Routers  []canonicalEntry `json:"routers"`
+		Services []canonicalEntry `json:"services"`
+	}{routers, services}
+
+	data, _ := json.Marshal(out)
+	return data
+}
+
+// hashConfig returns a deterministic hash of the config, used for change
+// detection so we only push updates when something actually changed.
+func hashConfig(cfg *DynConfig) string {
+	return string(canonicalJSON(cfg))
 }
