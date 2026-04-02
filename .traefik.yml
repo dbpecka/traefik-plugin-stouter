@@ -2,3 +2,9 @@ displayName: Stouter Provider
 type: provider
 import: github.com/dbpecka/traefik-plugin-stouter
 summary: Dynamic Traefik configuration from stouter tunneled services
+
+testData:
+  pollInterval: 5s
+  endpoint: http://127.0.0.1:5381
+  defaultEntryPoints:
+    - web
