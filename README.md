@@ -1,6 +1,6 @@
 # traefik-plugin-stouter
 
-A Traefik provider plugin that polls the [stouter](https://github.com/dpecka/stouter) subscribe REST API and dynamically creates HTTP routers and services for each tunneled service.
+A Traefik provider plugin that polls the [stouter](https://github.com/dbpecka/stouter) subscribe REST API and dynamically creates HTTP routers and services for each tunneled service.
 
 ## Installation
 
@@ -10,7 +10,7 @@ Add the plugin to your Traefik static configuration:
 experimental:
   plugins:
     stouter:
-      moduleName: github.com/dpecka/traefik-plugin-stouter
+      moduleName: github.com/dbpecka/traefik-plugin-stouter
       version: v0.1.0
 ```
 
