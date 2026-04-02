@@ -63,9 +63,14 @@ type DynConfig struct {
 
 // MarshalJSON implements json.Marshaler so *DynConfig satisfies the channel
 // type (chan<- json.Marshaler) required by Traefik's Provide method.
+// Note: the usual "type Alias" trick causes infinite recursion under yaegi,
+// so we build a plain map instead.
 func (d *DynConfig) MarshalJSON() ([]byte, error) {
-	type Alias DynConfig
-	return json.Marshal((*Alias)(d))
+	m := make(map[string]interface{}, 1)
+	if d.HTTP != nil {
+		m["http"] = d.HTTP
+	}
+	return json.Marshal(m)
 }
 
 // HTTPConfig contains the dynamic HTTP routers and services.
