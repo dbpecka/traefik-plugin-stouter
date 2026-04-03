@@ -28,6 +28,7 @@ type Config struct {
 	Endpoint          string   `json:"endpoint,omitempty"`
 	RuleTemplate      string   `json:"ruleTemplate,omitempty"`
 	DefaultEntryPoints []string `json:"defaultEntryPoints,omitempty"`
+	CertResolver      string   `json:"certResolver,omitempty"`
 }
 
 // CreateConfig returns a Config populated with sensible defaults.
@@ -37,6 +38,7 @@ func CreateConfig() *Config {
 		Endpoint:          "http://127.0.0.1:5381",
 		RuleTemplate:      "Host(`{{ .Name }}.stouter.local`)",
 		DefaultEntryPoints: []string{"web"},
+		CertResolver:      "acme",
 	}
 }
 
@@ -81,6 +83,7 @@ type HTTPConfig struct {
 
 // RouterTLS holds TLS configuration for a router.
 type RouterTLS struct {
+	CertResolver string `json:"certResolver,omitempty"`
 }
 
 // Router is a Traefik HTTP router.
@@ -117,6 +120,7 @@ type Provider struct {
 	endpoint     string
 	ruleTpl      *template.Template
 	entryPoints  []string
+	certResolver string
 	httpClient   *http.Client
 
 	mu     sync.Mutex
@@ -141,6 +145,7 @@ func New(_ context.Context, config *Config, name string) (*Provider, error) {
 		endpoint:     config.Endpoint,
 		ruleTpl:      tpl,
 		entryPoints:  config.DefaultEntryPoints,
+		certResolver: config.CertResolver,
 		httpClient: &http.Client{
 			Timeout: d - d/10, // 90% of poll interval
 		},
@@ -189,7 +194,7 @@ func (p *Provider) poll(ctx context.Context, cfgChan chan<- json.Marshaler) {
 		if err != nil {
 			log.Printf("[stouter] failed to fetch services: %v", err)
 		} else {
-			cfg := buildDynamicConfig(services, p.ruleTpl, p.entryPoints)
+			cfg := buildDynamicConfig(services, p.ruleTpl, p.entryPoints, p.certResolver)
 			hash := hashConfig(cfg)
 			if hash != lastHash {
 				var msg json.Marshaler = cfg
@@ -242,7 +247,7 @@ func fetchServices(client *http.Client, endpoint string) ([]StouterService, erro
 
 // buildDynamicConfig maps a slice of stouter services to a Traefik dynamic
 // configuration with one router and one service per stouter service.
-func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, entryPoints []string) *DynConfig {
+func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, entryPoints []string, certResolver string) *DynConfig {
 	routers := make(map[string]*Router, len(services))
 	svcMap := make(map[string]*Service, len(services))
 
@@ -269,7 +274,7 @@ func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, e
 			Rule:        rule,
 			Service:     key,
 			EntryPoints: entryPoints,
-			TLS:         &RouterTLS{},
+			TLS:         &RouterTLS{CertResolver: certResolver},
 		}
 
 		svcMap[key] = &Service{

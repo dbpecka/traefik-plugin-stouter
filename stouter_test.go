@@ -29,6 +29,9 @@ func TestCreateConfig(t *testing.T) {
 	if len(cfg.DefaultEntryPoints) != 1 || cfg.DefaultEntryPoints[0] != "web" {
 		t.Errorf("DefaultEntryPoints = %v", cfg.DefaultEntryPoints)
 	}
+	if cfg.CertResolver != "acme" {
+		t.Errorf("CertResolver = %q, want %q", cfg.CertResolver, "acme")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +103,7 @@ func TestBuildDynamicConfig(t *testing.T) {
 		{Name: "grafana", Port: 3000, Address: "127.0.0.1:3000"},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints)
+	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
 
 	if cfg.HTTP == nil {
 		t.Fatal("HTTP config is nil")
@@ -148,7 +151,7 @@ func TestBuildDynamicConfigCustomTemplate(t *testing.T) {
 		{Name: "api", Port: 9090, Address: "127.0.0.1:9090"},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints)
+	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
 
 	r := cfg.HTTP.Routers["stouter-api"]
 	if r.Rule != "PathPrefix(`/api`)" {
@@ -161,7 +164,7 @@ func TestBuildDynamicConfigCustomTemplate(t *testing.T) {
 
 func TestBuildDynamicConfigEmpty(t *testing.T) {
 	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.local`)"))
-	cfg := buildDynamicConfig(nil, tpl, []string{"web"})
+	cfg := buildDynamicConfig(nil, tpl, []string{"web"}, "acme")
 
 	if len(cfg.HTTP.Routers) != 0 {
 		t.Errorf("expected 0 routers, got %d", len(cfg.HTTP.Routers))
@@ -181,16 +184,16 @@ func TestHashConfigChangeDetection(t *testing.T) {
 
 	cfg1 := buildDynamicConfig([]StouterService{
 		{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
-	}, tpl, ep)
+	}, tpl, ep, "acme")
 
 	cfg2 := buildDynamicConfig([]StouterService{
 		{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
-	}, tpl, ep)
+	}, tpl, ep, "acme")
 
 	cfg3 := buildDynamicConfig([]StouterService{
 		{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
 		{Name: "b", Port: 2000, Address: "127.0.0.1:2000"},
-	}, tpl, ep)
+	}, tpl, ep, "acme")
 
 	h1 := hashConfig(cfg1)
 	h2 := hashConfig(cfg2)
@@ -352,7 +355,7 @@ func TestBuildDynamicConfigCustomDomains(t *testing.T) {
 		{Name: "equipflo-test-web", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"equipflo.com", "www.equipflo.com"}},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints)
+	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
 
 	r, ok := cfg.HTTP.Routers["stouter-equipflo-test-web"]
 	if !ok {
@@ -371,7 +374,7 @@ func TestBuildDynamicConfigSingleCustomDomain(t *testing.T) {
 		{Name: "web", Port: 8080, Address: "127.0.0.1:8080", Domains: []string{"example.com"}},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, []string{"web"})
+	cfg := buildDynamicConfig(services, tpl, []string{"web"}, "acme")
 
 	r := cfg.HTTP.Routers["stouter-web"]
 	if r.Rule != "Host(`example.com`)" {
@@ -388,7 +391,7 @@ func TestBuildDynamicConfigMixedDomainsAndTemplate(t *testing.T) {
 		{Name: "no-domains", Port: 8080, Address: "127.0.0.1:8080"},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints)
+	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
 
 	// Service with domains should use Host() rule.
 	r1 := cfg.HTTP.Routers["stouter-with-domains"]
