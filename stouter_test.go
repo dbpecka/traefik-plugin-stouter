@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
@@ -365,6 +366,19 @@ func TestBuildDynamicConfigCustomDomains(t *testing.T) {
 	if r.Rule != want {
 		t.Errorf("rule = %q, want %q", r.Rule, want)
 	}
+
+	if r.TLS == nil {
+		t.Fatal("router TLS is nil")
+	}
+	if len(r.TLS.Domains) != 1 {
+		t.Fatalf("TLS.Domains length = %d, want 1", len(r.TLS.Domains))
+	}
+	if r.TLS.Domains[0].Main != "equipflo.com" {
+		t.Errorf("TLS.Domains[0].Main = %q, want %q", r.TLS.Domains[0].Main, "equipflo.com")
+	}
+	if len(r.TLS.Domains[0].SANs) != 1 || r.TLS.Domains[0].SANs[0] != "www.equipflo.com" {
+		t.Errorf("TLS.Domains[0].SANs = %v, want [www.equipflo.com]", r.TLS.Domains[0].SANs)
+	}
 }
 
 func TestBuildDynamicConfigSingleCustomDomain(t *testing.T) {
@@ -379,6 +393,19 @@ func TestBuildDynamicConfigSingleCustomDomain(t *testing.T) {
 	r := cfg.HTTP.Routers["stouter-web"]
 	if r.Rule != "Host(`example.com`)" {
 		t.Errorf("rule = %q", r.Rule)
+	}
+
+	if r.TLS == nil {
+		t.Fatal("router TLS is nil")
+	}
+	if len(r.TLS.Domains) != 1 {
+		t.Fatalf("TLS.Domains length = %d, want 1", len(r.TLS.Domains))
+	}
+	if r.TLS.Domains[0].Main != "example.com" {
+		t.Errorf("TLS.Domains[0].Main = %q, want %q", r.TLS.Domains[0].Main, "example.com")
+	}
+	if len(r.TLS.Domains[0].SANs) != 0 {
+		t.Errorf("TLS.Domains[0].SANs = %v, want empty", r.TLS.Domains[0].SANs)
 	}
 }
 
@@ -403,6 +430,22 @@ func TestBuildDynamicConfigMixedDomainsAndTemplate(t *testing.T) {
 	r2 := cfg.HTTP.Routers["stouter-no-domains"]
 	if r2.Rule != "Host(`no-domains.stouter.local`)" {
 		t.Errorf("no-domains rule = %q, want Host(`no-domains.stouter.local`)", r2.Rule)
+	}
+
+	// Custom-domain router gets explicit tls.domains.
+	if r1.TLS == nil || len(r1.TLS.Domains) != 1 || r1.TLS.Domains[0].Main != "custom.com" {
+		t.Errorf("with-domains TLS.Domains = %+v, want [{Main:custom.com}]", r1.TLS)
+	}
+	if len(r1.TLS.Domains[0].SANs) != 0 {
+		t.Errorf("with-domains SANs = %v, want empty", r1.TLS.Domains[0].SANs)
+	}
+
+	// Template-fallback router must not set tls.domains.
+	if r2.TLS == nil {
+		t.Fatal("no-domains router TLS is nil")
+	}
+	if r2.TLS.Domains != nil {
+		t.Errorf("no-domains TLS.Domains = %v, want nil", r2.TLS.Domains)
 	}
 }
 
@@ -431,6 +474,32 @@ func TestFetchServicesWithDomains(t *testing.T) {
 	}
 	if services[0].Domains[0] != "example.com" || services[0].Domains[1] != "www.example.com" {
 		t.Errorf("domains = %v", services[0].Domains)
+	}
+}
+
+// TestMarshalRouterTLSDomains verifies the JSON shape of a router with
+// tls.domains matches what Traefik expects (and what yaegi produces).
+func TestMarshalRouterTLSDomains(t *testing.T) {
+	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
+	services := []StouterService{
+		{Name: "x", Address: "127.0.0.1:1", Domains: []string{"a.com", "b.com"}},
+	}
+	cfg := buildDynamicConfig(services, tpl, []string{"websecure"}, "acme")
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(data)
+
+	for _, want := range []string{
+		`"tls":{`,
+		`"certResolver":"acme"`,
+		`"domains":[{"main":"a.com","sans":["b.com"]}]`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("JSON missing %q\ngot: %s", want, got)
+		}
 	}
 }
 

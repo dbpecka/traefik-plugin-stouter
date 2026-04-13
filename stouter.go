@@ -81,9 +81,16 @@ type HTTPConfig struct {
 	Services map[string]*Service `json:"services,omitempty"`
 }
 
+// Domain represents a TLS domain entry with a main name and optional SANs.
+type Domain struct {
+	Main string   `json:"main,omitempty"`
+	SANs []string `json:"sans,omitempty"`
+}
+
 // RouterTLS holds TLS configuration for a router.
 type RouterTLS struct {
-	CertResolver string `json:"certResolver,omitempty"`
+	CertResolver string   `json:"certResolver,omitempty"`
+	Domains      []Domain `json:"domains,omitempty"`
 }
 
 // Router is a Traefik HTTP router.
@@ -270,11 +277,20 @@ func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, e
 			rule = ruleBuf.String()
 		}
 
+		tls := &RouterTLS{CertResolver: certResolver}
+		if len(svc.Domains) > 0 {
+			d := Domain{Main: svc.Domains[0]}
+			if len(svc.Domains) > 1 {
+				d.SANs = append([]string(nil), svc.Domains[1:]...)
+			}
+			tls.Domains = []Domain{d}
+		}
+
 		routers[key] = &Router{
 			Rule:        rule,
 			Service:     key,
 			EntryPoints: entryPoints,
-			TLS:         &RouterTLS{CertResolver: certResolver},
+			TLS:         tls,
 		}
 
 		svcMap[key] = &Service{
