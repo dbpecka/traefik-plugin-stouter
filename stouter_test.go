@@ -12,6 +12,31 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+func mustTpl(t *testing.T, s string) *template.Template {
+	t.Helper()
+	return template.Must(template.New("rule").Parse(s))
+}
+
+func singleInstance(name, ruleTpl string, entryPoints []string, certResolver string) []instance {
+	if certResolver == "" {
+		certResolver = "acme"
+	}
+	if len(entryPoints) == 0 {
+		entryPoints = []string{"web"}
+	}
+	return []instance{{
+		name:         name,
+		endpoint:     "http://unused",
+		ruleTpl:      template.Must(template.New("rule").Parse(ruleTpl)),
+		entryPoints:  entryPoints,
+		certResolver: certResolver,
+	}}
+}
+
+// ---------------------------------------------------------------------------
 // CreateConfig defaults
 // ---------------------------------------------------------------------------
 
@@ -21,17 +46,24 @@ func TestCreateConfig(t *testing.T) {
 	if cfg.PollInterval != "5s" {
 		t.Errorf("PollInterval = %q, want %q", cfg.PollInterval, "5s")
 	}
-	if cfg.Endpoint != "http://127.0.0.1:5381" {
-		t.Errorf("Endpoint = %q, want %q", cfg.Endpoint, "http://127.0.0.1:5381")
+	if len(cfg.Instances) != 1 {
+		t.Fatalf("Instances length = %d, want 1", len(cfg.Instances))
 	}
-	if cfg.RuleTemplate != "Host(`{{ .Name }}.stouter.local`)" {
-		t.Errorf("RuleTemplate = %q", cfg.RuleTemplate)
+	ic := cfg.Instances[0]
+	if ic.Name != "default" {
+		t.Errorf("Instances[0].Name = %q, want %q", ic.Name, "default")
 	}
-	if len(cfg.DefaultEntryPoints) != 1 || cfg.DefaultEntryPoints[0] != "web" {
-		t.Errorf("DefaultEntryPoints = %v", cfg.DefaultEntryPoints)
+	if ic.Endpoint != "http://127.0.0.1:5381" {
+		t.Errorf("Instances[0].Endpoint = %q", ic.Endpoint)
 	}
-	if cfg.CertResolver != "acme" {
-		t.Errorf("CertResolver = %q, want %q", cfg.CertResolver, "acme")
+	if ic.RuleTemplate != "Host(`{{ .Name }}.stouter.local`)" {
+		t.Errorf("Instances[0].RuleTemplate = %q", ic.RuleTemplate)
+	}
+	if len(ic.DefaultEntryPoints) != 1 || ic.DefaultEntryPoints[0] != "web" {
+		t.Errorf("Instances[0].DefaultEntryPoints = %v", ic.DefaultEntryPoints)
+	}
+	if ic.CertResolver != "acme" {
+		t.Errorf("Instances[0].CertResolver = %q", ic.CertResolver)
 	}
 }
 
@@ -96,15 +128,15 @@ func TestFetchServicesInvalidJSON(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildDynamicConfig(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
-	entryPoints := []string{"web"}
-
-	services := []StouterService{
-		{Name: "plex", Port: 32400, Address: "127.0.0.1:32400"},
-		{Name: "grafana", Port: 3000, Address: "127.0.0.1:3000"},
+	insts := singleInstance("default", "Host(`{{ .Name }}.stouter.local`)", []string{"web"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {
+			{Name: "plex", Port: 32400, Address: "127.0.0.1:32400"},
+			{Name: "grafana", Port: 3000, Address: "127.0.0.1:3000"},
+		},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
+	cfg := buildDynamicConfig(insts, cache)
 
 	if cfg.HTTP == nil {
 		t.Fatal("HTTP config is nil")
@@ -116,25 +148,23 @@ func TestBuildDynamicConfig(t *testing.T) {
 		t.Fatalf("got %d services, want 2", len(cfg.HTTP.Services))
 	}
 
-	// Check plex router.
-	r, ok := cfg.HTTP.Routers["stouter-plex"]
+	r, ok := cfg.HTTP.Routers["stouter-default-plex"]
 	if !ok {
-		t.Fatal("missing router stouter-plex")
+		t.Fatal("missing router stouter-default-plex")
 	}
 	if r.Rule != "Host(`plex.stouter.local`)" {
 		t.Errorf("rule = %q", r.Rule)
 	}
-	if r.Service != "stouter-plex" {
+	if r.Service != "stouter-default-plex" {
 		t.Errorf("service = %q", r.Service)
 	}
 	if len(r.EntryPoints) != 1 || r.EntryPoints[0] != "web" {
 		t.Errorf("entryPoints = %v", r.EntryPoints)
 	}
 
-	// Check plex service.
-	s, ok := cfg.HTTP.Services["stouter-plex"]
+	s, ok := cfg.HTTP.Services["stouter-default-plex"]
 	if !ok {
-		t.Fatal("missing service stouter-plex")
+		t.Fatal("missing service stouter-default-plex")
 	}
 	if len(s.LoadBalancer.Servers) != 1 {
 		t.Fatalf("got %d servers", len(s.LoadBalancer.Servers))
@@ -145,16 +175,14 @@ func TestBuildDynamicConfig(t *testing.T) {
 }
 
 func TestBuildDynamicConfigCustomTemplate(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("PathPrefix(`/{{ .Name }}`)"))
-	entryPoints := []string{"websecure"}
-
-	services := []StouterService{
-		{Name: "api", Port: 9090, Address: "127.0.0.1:9090"},
+	insts := singleInstance("default", "PathPrefix(`/{{ .Name }}`)", []string{"websecure"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {{Name: "api", Port: 9090, Address: "127.0.0.1:9090"}},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
+	cfg := buildDynamicConfig(insts, cache)
 
-	r := cfg.HTTP.Routers["stouter-api"]
+	r := cfg.HTTP.Routers["stouter-default-api"]
 	if r.Rule != "PathPrefix(`/api`)" {
 		t.Errorf("rule = %q", r.Rule)
 	}
@@ -164,8 +192,8 @@ func TestBuildDynamicConfigCustomTemplate(t *testing.T) {
 }
 
 func TestBuildDynamicConfigEmpty(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.local`)"))
-	cfg := buildDynamicConfig(nil, tpl, []string{"web"}, "acme")
+	insts := singleInstance("default", "Host(`{{ .Name }}.local`)", []string{"web"}, "acme")
+	cfg := buildDynamicConfig(insts, map[string][]StouterService{})
 
 	if len(cfg.HTTP.Routers) != 0 {
 		t.Errorf("expected 0 routers, got %d", len(cfg.HTTP.Routers))
@@ -175,26 +203,117 @@ func TestBuildDynamicConfigEmpty(t *testing.T) {
 	}
 }
 
+func TestBuildDynamicConfigMultipleInstances(t *testing.T) {
+	insts := []instance{
+		{
+			name:         "prod",
+			endpoint:     "http://unused",
+			ruleTpl:      mustTpl(t, "Host(`{{ .Name }}.prod.example.com`)"),
+			entryPoints:  []string{"websecure"},
+			certResolver: "acme-prod",
+		},
+		{
+			name:         "dev",
+			endpoint:     "http://unused",
+			ruleTpl:      mustTpl(t, "Host(`{{ .Name }}.dev.example.com`)"),
+			entryPoints:  []string{"web"},
+			certResolver: "acme-dev",
+		},
+	}
+	cache := map[string][]StouterService{
+		"prod": {{Name: "web", Port: 80, Address: "10.0.0.1:80"}},
+		"dev":  {{Name: "web", Port: 80, Address: "10.0.0.2:80"}},
+	}
+
+	cfg := buildDynamicConfig(insts, cache)
+
+	if len(cfg.HTTP.Routers) != 2 {
+		t.Fatalf("routers = %d, want 2", len(cfg.HTTP.Routers))
+	}
+
+	prod, ok := cfg.HTTP.Routers["stouter-prod-web"]
+	if !ok {
+		t.Fatal("missing router stouter-prod-web")
+	}
+	if prod.Rule != "Host(`web.prod.example.com`)" {
+		t.Errorf("prod rule = %q", prod.Rule)
+	}
+	if prod.EntryPoints[0] != "websecure" {
+		t.Errorf("prod entryPoints = %v", prod.EntryPoints)
+	}
+	if prod.TLS.CertResolver != "acme-prod" {
+		t.Errorf("prod certResolver = %q", prod.TLS.CertResolver)
+	}
+
+	dev, ok := cfg.HTTP.Routers["stouter-dev-web"]
+	if !ok {
+		t.Fatal("missing router stouter-dev-web")
+	}
+	if dev.Rule != "Host(`web.dev.example.com`)" {
+		t.Errorf("dev rule = %q", dev.Rule)
+	}
+	if dev.EntryPoints[0] != "web" {
+		t.Errorf("dev entryPoints = %v", dev.EntryPoints)
+	}
+
+	// Same service name across instances must produce distinct backends.
+	if cfg.HTTP.Services["stouter-prod-web"].LoadBalancer.Servers[0].URL == cfg.HTTP.Services["stouter-dev-web"].LoadBalancer.Servers[0].URL {
+		t.Error("prod and dev services collided")
+	}
+}
+
+func TestBuildDynamicConfigMissingInstanceInCache(t *testing.T) {
+	// Two instances configured, but the cache only has data for one. The other
+	// is silently skipped (e.g. first poll never succeeded yet).
+	insts := []instance{
+		{
+			name:         "a",
+			endpoint:     "http://unused",
+			ruleTpl:      mustTpl(t, "Host(`{{ .Name }}.a`)"),
+			entryPoints:  []string{"web"},
+			certResolver: "acme",
+		},
+		{
+			name:         "b",
+			endpoint:     "http://unused",
+			ruleTpl:      mustTpl(t, "Host(`{{ .Name }}.b`)"),
+			entryPoints:  []string{"web"},
+			certResolver: "acme",
+		},
+	}
+	cache := map[string][]StouterService{
+		"b": {{Name: "svc", Port: 1, Address: "127.0.0.1:1"}},
+	}
+
+	cfg := buildDynamicConfig(insts, cache)
+
+	if len(cfg.HTTP.Routers) != 1 {
+		t.Fatalf("routers = %d, want 1", len(cfg.HTTP.Routers))
+	}
+	if _, ok := cfg.HTTP.Routers["stouter-b-svc"]; !ok {
+		t.Error("expected stouter-b-svc")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Change detection
 // ---------------------------------------------------------------------------
 
 func TestHashConfigChangeDetection(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.local`)"))
-	ep := []string{"web"}
+	insts := singleInstance("default", "Host(`{{ .Name }}.local`)", []string{"web"}, "acme")
 
-	cfg1 := buildDynamicConfig([]StouterService{
-		{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
-	}, tpl, ep, "acme")
-
-	cfg2 := buildDynamicConfig([]StouterService{
-		{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
-	}, tpl, ep, "acme")
-
-	cfg3 := buildDynamicConfig([]StouterService{
-		{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
-		{Name: "b", Port: 2000, Address: "127.0.0.1:2000"},
-	}, tpl, ep, "acme")
+	cfg1 := buildDynamicConfig(insts, map[string][]StouterService{
+		"default": {{Name: "a", Port: 1000, Address: "127.0.0.1:1000"}},
+	})
+	cfg2 := buildDynamicConfig(insts, map[string][]StouterService{
+		"default": {{Name: "a", Port: 1000, Address: "127.0.0.1:1000"}},
+	})
+	cfg3 := buildDynamicConfig(insts, map[string][]StouterService{
+		"default": {
+			{Name: "a", Port: 1000, Address: "127.0.0.1:1000"},
+			{Name: "b", Port: 2000, Address: "127.0.0.1:2000"},
+		},
+	})
 
 	h1 := hashConfig(cfg1)
 	h2 := hashConfig(cfg2)
@@ -216,14 +335,14 @@ func TestDynConfigMarshalJSON(t *testing.T) {
 	cfg := &DynConfig{
 		HTTP: &HTTPConfig{
 			Routers: map[string]*Router{
-				"stouter-test": {
+				"stouter-default-test": {
 					Rule:        "Host(`test.local`)",
-					Service:     "stouter-test",
+					Service:     "stouter-default-test",
 					EntryPoints: []string{"web"},
 				},
 			},
 			Services: map[string]*Service{
-				"stouter-test": {
+				"stouter-default-test": {
 					LoadBalancer: &LoadBalancer{
 						Servers: []Server{{URL: "http://127.0.0.1:8080"}},
 					},
@@ -237,13 +356,12 @@ func TestDynConfigMarshalJSON(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	// Round-trip to verify structure.
 	var parsed DynConfig
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if parsed.HTTP.Routers["stouter-test"].Rule != "Host(`test.local`)" {
-		t.Errorf("round-trip rule = %q", parsed.HTTP.Routers["stouter-test"].Rule)
+	if parsed.HTTP.Routers["stouter-default-test"].Rule != "Host(`test.local`)" {
+		t.Errorf("round-trip rule = %q", parsed.HTTP.Routers["stouter-default-test"].Rule)
 	}
 }
 
@@ -263,11 +381,58 @@ func TestNewInvalidPollInterval(t *testing.T) {
 
 func TestNewInvalidRuleTemplate(t *testing.T) {
 	cfg := CreateConfig()
-	cfg.RuleTemplate = "{{ .Bad"
+	cfg.Instances[0].RuleTemplate = "{{ .Bad"
 
 	_, err := New(nil, cfg, "test")
 	if err == nil {
 		t.Fatal("expected error for invalid ruleTemplate")
+	}
+}
+
+func TestNewRequiresAtLeastOneInstance(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.Instances = nil
+
+	_, err := New(nil, cfg, "test")
+	if err == nil {
+		t.Fatal("expected error when no instances configured")
+	}
+}
+
+func TestNewRequiresInstanceName(t *testing.T) {
+	cfg := CreateConfig()
+	cfg.Instances[0].Name = ""
+
+	_, err := New(nil, cfg, "test")
+	if err == nil {
+		t.Fatal("expected error when instance name missing")
+	}
+}
+
+func TestNewRejectsDuplicateInstanceNames(t *testing.T) {
+	cfg := &Config{
+		PollInterval: "5s",
+		Instances: []InstanceConfig{
+			{Name: "a", Endpoint: "http://x"},
+			{Name: "a", Endpoint: "http://y"},
+		},
+	}
+
+	_, err := New(nil, cfg, "test")
+	if err == nil {
+		t.Fatal("expected error for duplicate instance names")
+	}
+}
+
+func TestNewRequiresInstanceEndpoint(t *testing.T) {
+	cfg := &Config{
+		PollInterval: "5s",
+		Instances:    []InstanceConfig{{Name: "a"}},
+	}
+
+	_, err := New(nil, cfg, "test")
+	if err == nil {
+		t.Fatal("expected error for missing endpoint")
 	}
 }
 
@@ -299,8 +464,8 @@ func TestProvideIntegration(t *testing.T) {
 	defer srv.Close()
 
 	cfg := CreateConfig()
-	cfg.Endpoint = srv.URL
 	cfg.PollInterval = "50ms"
+	cfg.Instances[0].Endpoint = srv.URL
 
 	p, err := New(nil, cfg, "stouter")
 	if err != nil {
@@ -313,7 +478,6 @@ func TestProvideIntegration(t *testing.T) {
 	}
 	defer p.Stop()
 
-	// Wait for the first config push.
 	select {
 	case msg := <-cfgChan:
 		data, _ := json.Marshal(msg)
@@ -321,27 +485,149 @@ func TestProvideIntegration(t *testing.T) {
 		if err := json.Unmarshal(data, &got); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		if _, ok := got.HTTP.Routers["stouter-svc1"]; !ok {
-			t.Error("missing router stouter-svc1")
+		if _, ok := got.HTTP.Routers["stouter-default-svc1"]; !ok {
+			t.Errorf("missing router stouter-default-svc1, got routers: %v", got.HTTP.Routers)
 		}
-		if _, ok := got.HTTP.Services["stouter-svc1"]; !ok {
-			t.Error("missing service stouter-svc1")
+		if _, ok := got.HTTP.Services["stouter-default-svc1"]; !ok {
+			t.Error("missing service stouter-default-svc1")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for config")
 	}
 
-	// Second tick should NOT produce a duplicate (same hash).
 	select {
 	case <-cfgChan:
 		t.Error("unexpected duplicate config push")
 	case <-time.After(200 * time.Millisecond):
-		// Expected — no duplicate.
+	}
+}
+
+func TestProvideIntegrationMultipleInstances(t *testing.T) {
+	bodyA := `[{"name":"svc","port":4000,"address":"127.0.0.1:4000"}]`
+	bodyB := `[{"name":"svc","port":5000,"address":"127.0.0.1:5000"}]`
+
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, bodyA)
+	}))
+	defer srvA.Close()
+
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, bodyB)
+	}))
+	defer srvB.Close()
+
+	cfg := &Config{
+		PollInterval: "50ms",
+		Instances: []InstanceConfig{
+			{Name: "a", Endpoint: srvA.URL, RuleTemplate: "Host(`{{ .Name }}.a`)", DefaultEntryPoints: []string{"web"}},
+			{Name: "b", Endpoint: srvB.URL, RuleTemplate: "Host(`{{ .Name }}.b`)", DefaultEntryPoints: []string{"web"}},
+		},
 	}
 
-	// Verify that after changing the hash, a new config IS pushed.
-	// (We can't easily change the mock mid-test without races, so we
-	// just verify the no-duplicate path above.)
+	p, err := New(nil, cfg, "stouter")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	cfgChan := make(chan json.Marshaler, 1)
+	if err := p.Provide(cfgChan); err != nil {
+		t.Fatalf("Provide: %v", err)
+	}
+	defer p.Stop()
+
+	select {
+	case msg := <-cfgChan:
+		data, _ := json.Marshal(msg)
+		var got DynConfig
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := got.HTTP.Routers["stouter-a-svc"]; !ok {
+			t.Errorf("missing router stouter-a-svc, got: %v", got.HTTP.Routers)
+		}
+		if _, ok := got.HTTP.Routers["stouter-b-svc"]; !ok {
+			t.Errorf("missing router stouter-b-svc, got: %v", got.HTTP.Routers)
+		}
+		if got.HTTP.Routers["stouter-a-svc"].Rule != "Host(`svc.a`)" {
+			t.Errorf("a rule = %q", got.HTTP.Routers["stouter-a-svc"].Rule)
+		}
+		if got.HTTP.Routers["stouter-b-svc"].Rule != "Host(`svc.b`)" {
+			t.Errorf("b rule = %q", got.HTTP.Routers["stouter-b-svc"].Rule)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for config")
+	}
+}
+
+// One instance failing must not blow away the cached state of healthy
+// instances on subsequent polls.
+func TestProvideKeepsCacheOnInstanceFailure(t *testing.T) {
+	srvGood := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `[{"name":"svc","port":1,"address":"127.0.0.1:1"}]`)
+	}))
+	defer srvGood.Close()
+
+	// Bad endpoint that always returns 500.
+	srvBad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srvBad.Close()
+
+	cfg := &Config{
+		PollInterval: "30ms",
+		Instances: []InstanceConfig{
+			{Name: "good", Endpoint: srvGood.URL, RuleTemplate: "Host(`{{ .Name }}.good`)", DefaultEntryPoints: []string{"web"}},
+			{Name: "bad", Endpoint: srvBad.URL, RuleTemplate: "Host(`{{ .Name }}.bad`)", DefaultEntryPoints: []string{"web"}},
+		},
+	}
+
+	p, err := New(nil, cfg, "stouter")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	cfgChan := make(chan json.Marshaler, 4)
+	if err := p.Provide(cfgChan); err != nil {
+		t.Fatalf("Provide: %v", err)
+	}
+	defer p.Stop()
+
+	select {
+	case msg := <-cfgChan:
+		data, _ := json.Marshal(msg)
+		var got DynConfig
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := got.HTTP.Routers["stouter-good-svc"]; !ok {
+			t.Error("missing router from healthy instance")
+		}
+		if _, ok := got.HTTP.Routers["stouter-bad-svc"]; ok {
+			t.Error("did not expect router from failing instance")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first config push")
+	}
+
+	// No further pushes expected (hash unchanged across ticks even though bad
+	// keeps failing).
+	select {
+	case <-cfgChan:
+		t.Error("unexpected duplicate config push")
+	case <-time.After(150 * time.Millisecond):
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -349,18 +635,18 @@ func TestProvideIntegration(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildDynamicConfigCustomDomains(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
-	entryPoints := []string{"websecure"}
-
-	services := []StouterService{
-		{Name: "equipflo-test-web", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"equipflo.com", "www.equipflo.com"}},
+	insts := singleInstance("default", "Host(`{{ .Name }}.stouter.local`)", []string{"websecure"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {
+			{Name: "equipflo-test-web", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"equipflo.com", "www.equipflo.com"}},
+		},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
+	cfg := buildDynamicConfig(insts, cache)
 
-	r, ok := cfg.HTTP.Routers["stouter-equipflo-test-web"]
+	r, ok := cfg.HTTP.Routers["stouter-default-equipflo-test-web"]
 	if !ok {
-		t.Fatal("missing router stouter-equipflo-test-web")
+		t.Fatal("missing router stouter-default-equipflo-test-web")
 	}
 	want := "Host(`equipflo.com`) || Host(`www.equipflo.com`)"
 	if r.Rule != want {
@@ -382,15 +668,16 @@ func TestBuildDynamicConfigCustomDomains(t *testing.T) {
 }
 
 func TestBuildDynamicConfigSingleCustomDomain(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
-
-	services := []StouterService{
-		{Name: "web", Port: 8080, Address: "127.0.0.1:8080", Domains: []string{"example.com"}},
+	insts := singleInstance("default", "Host(`{{ .Name }}.stouter.local`)", []string{"web"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {
+			{Name: "web", Port: 8080, Address: "127.0.0.1:8080", Domains: []string{"example.com"}},
+		},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, []string{"web"}, "acme")
+	cfg := buildDynamicConfig(insts, cache)
 
-	r := cfg.HTTP.Routers["stouter-web"]
+	r := cfg.HTTP.Routers["stouter-default-web"]
 	if r.Rule != "Host(`example.com`)" {
 		t.Errorf("rule = %q", r.Rule)
 	}
@@ -410,29 +697,26 @@ func TestBuildDynamicConfigSingleCustomDomain(t *testing.T) {
 }
 
 func TestBuildDynamicConfigMixedDomainsAndTemplate(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
-	entryPoints := []string{"web"}
-
-	services := []StouterService{
-		{Name: "with-domains", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"custom.com"}},
-		{Name: "no-domains", Port: 8080, Address: "127.0.0.1:8080"},
+	insts := singleInstance("default", "Host(`{{ .Name }}.stouter.local`)", []string{"web"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {
+			{Name: "with-domains", Port: 3200, Address: "127.0.0.1:3200", Domains: []string{"custom.com"}},
+			{Name: "no-domains", Port: 8080, Address: "127.0.0.1:8080"},
+		},
 	}
 
-	cfg := buildDynamicConfig(services, tpl, entryPoints, "acme")
+	cfg := buildDynamicConfig(insts, cache)
 
-	// Service with domains should use Host() rule.
-	r1 := cfg.HTTP.Routers["stouter-with-domains"]
+	r1 := cfg.HTTP.Routers["stouter-default-with-domains"]
 	if r1.Rule != "Host(`custom.com`)" {
 		t.Errorf("with-domains rule = %q, want Host(`custom.com`)", r1.Rule)
 	}
 
-	// Service without domains should fall back to template.
-	r2 := cfg.HTTP.Routers["stouter-no-domains"]
+	r2 := cfg.HTTP.Routers["stouter-default-no-domains"]
 	if r2.Rule != "Host(`no-domains.stouter.local`)" {
 		t.Errorf("no-domains rule = %q, want Host(`no-domains.stouter.local`)", r2.Rule)
 	}
 
-	// Custom-domain router gets explicit tls.domains.
 	if r1.TLS == nil || len(r1.TLS.Domains) != 1 || r1.TLS.Domains[0].Main != "custom.com" {
 		t.Errorf("with-domains TLS.Domains = %+v, want [{Main:custom.com}]", r1.TLS)
 	}
@@ -440,7 +724,6 @@ func TestBuildDynamicConfigMixedDomainsAndTemplate(t *testing.T) {
 		t.Errorf("with-domains SANs = %v, want empty", r1.TLS.Domains[0].SANs)
 	}
 
-	// Template-fallback router must not set tls.domains.
 	if r2.TLS == nil {
 		t.Fatal("no-domains router TLS is nil")
 	}
@@ -480,11 +763,11 @@ func TestFetchServicesWithDomains(t *testing.T) {
 // TestMarshalRouterTLSDomains verifies the JSON shape of a router with
 // tls.domains matches what Traefik expects (and what yaegi produces).
 func TestMarshalRouterTLSDomains(t *testing.T) {
-	tpl := template.Must(template.New("rule").Parse("Host(`{{ .Name }}.stouter.local`)"))
-	services := []StouterService{
-		{Name: "x", Address: "127.0.0.1:1", Domains: []string{"a.com", "b.com"}},
+	insts := singleInstance("default", "Host(`{{ .Name }}.stouter.local`)", []string{"websecure"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {{Name: "x", Address: "127.0.0.1:1", Domains: []string{"a.com", "b.com"}}},
 	}
-	cfg := buildDynamicConfig(services, tpl, []string{"websecure"}, "acme")
+	cfg := buildDynamicConfig(insts, cache)
 
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -509,7 +792,6 @@ func TestHashConfigNil(t *testing.T) {
 	if h == "" {
 		t.Error("expected non-empty hash for nil config")
 	}
-	// Should be deterministic.
 	if h != hashConfig(nil) {
 		t.Error("nil hash is not stable")
 	}

@@ -23,22 +23,37 @@ import (
 // ---------------------------------------------------------------------------
 
 // Config holds the plugin configuration supplied by the Traefik static config.
+//
+// One Traefik provider plugin can fan out to multiple stouter endpoints by
+// listing them under Instances. Each instance polls independently and
+// contributes routers/services into the merged dynamic configuration.
 type Config struct {
-	PollInterval      string   `json:"pollInterval,omitempty"`
-	Endpoint          string   `json:"endpoint,omitempty"`
-	RuleTemplate      string   `json:"ruleTemplate,omitempty"`
+	PollInterval string           `json:"pollInterval,omitempty"`
+	Instances    []InstanceConfig `json:"instances,omitempty"`
+}
+
+// InstanceConfig describes a single stouter endpoint to poll.
+type InstanceConfig struct {
+	Name               string   `json:"name,omitempty"`
+	Endpoint           string   `json:"endpoint,omitempty"`
+	RuleTemplate       string   `json:"ruleTemplate,omitempty"`
 	DefaultEntryPoints []string `json:"defaultEntryPoints,omitempty"`
-	CertResolver      string   `json:"certResolver,omitempty"`
+	CertResolver       string   `json:"certResolver,omitempty"`
 }
 
 // CreateConfig returns a Config populated with sensible defaults.
 func CreateConfig() *Config {
 	return &Config{
-		PollInterval:      "5s",
-		Endpoint:          "http://127.0.0.1:5381",
-		RuleTemplate:      "Host(`{{ .Name }}.stouter.local`)",
-		DefaultEntryPoints: []string{"web"},
-		CertResolver:      "acme",
+		PollInterval: "5s",
+		Instances: []InstanceConfig{
+			{
+				Name:               "default",
+				Endpoint:           "http://127.0.0.1:5381",
+				RuleTemplate:       "Host(`{{ .Name }}.stouter.local`)",
+				DefaultEntryPoints: []string{"web"},
+				CertResolver:       "acme",
+			},
+		},
 	}
 }
 
@@ -120,14 +135,20 @@ type Server struct {
 // Provider
 // ---------------------------------------------------------------------------
 
-// Provider implements the Traefik provider plugin interface.
-type Provider struct {
+// instance is the compiled runtime form of an InstanceConfig.
+type instance struct {
 	name         string
-	pollInterval time.Duration
 	endpoint     string
 	ruleTpl      *template.Template
 	entryPoints  []string
 	certResolver string
+}
+
+// Provider implements the Traefik provider plugin interface.
+type Provider struct {
+	name         string
+	pollInterval time.Duration
+	instances    []instance
 	httpClient   *http.Client
 
 	mu     sync.Mutex
@@ -141,18 +162,57 @@ func New(_ context.Context, config *Config, name string) (*Provider, error) {
 		return nil, fmt.Errorf("invalid pollInterval %q: %w", config.PollInterval, err)
 	}
 
-	tpl, err := template.New("rule").Parse(config.RuleTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("invalid ruleTemplate %q: %w", config.RuleTemplate, err)
+	if len(config.Instances) == 0 {
+		return nil, fmt.Errorf("at least one instance is required under `instances`")
+	}
+
+	seen := make(map[string]bool, len(config.Instances))
+	instances := make([]instance, len(config.Instances))
+	for i, ic := range config.Instances {
+		if ic.Name == "" {
+			return nil, fmt.Errorf("instance at index %d: name is required", i)
+		}
+		if seen[ic.Name] {
+			return nil, fmt.Errorf("duplicate instance name %q", ic.Name)
+		}
+		seen[ic.Name] = true
+
+		if ic.Endpoint == "" {
+			return nil, fmt.Errorf("instance %q: endpoint is required", ic.Name)
+		}
+
+		ruleStr := ic.RuleTemplate
+		if ruleStr == "" {
+			ruleStr = "Host(`{{ .Name }}.stouter.local`)"
+		}
+		tpl, err := template.New("rule-" + ic.Name).Parse(ruleStr)
+		if err != nil {
+			return nil, fmt.Errorf("instance %q: invalid ruleTemplate %q: %w", ic.Name, ruleStr, err)
+		}
+
+		eps := ic.DefaultEntryPoints
+		if len(eps) == 0 {
+			eps = []string{"web"}
+		}
+
+		certResolver := ic.CertResolver
+		if certResolver == "" {
+			certResolver = "acme"
+		}
+
+		instances[i] = instance{
+			name:         ic.Name,
+			endpoint:     ic.Endpoint,
+			ruleTpl:      tpl,
+			entryPoints:  eps,
+			certResolver: certResolver,
+		}
 	}
 
 	return &Provider{
 		name:         name,
 		pollInterval: d,
-		endpoint:     config.Endpoint,
-		ruleTpl:      tpl,
-		entryPoints:  config.DefaultEntryPoints,
-		certResolver: config.CertResolver,
+		instances:    instances,
 		httpClient: &http.Client{
 			Timeout: d - d/10, // 90% of poll interval
 		},
@@ -165,7 +225,7 @@ func (p *Provider) Init() error {
 }
 
 // Provide starts the polling loop and pushes dynamic configuration updates onto
-// cfgChan whenever the set of stouter services changes.
+// cfgChan whenever the merged set of stouter services changes.
 func (p *Provider) Provide(cfgChan chan<- json.Marshaler) error {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -193,24 +253,24 @@ func (p *Provider) poll(ctx context.Context, cfgChan chan<- json.Marshaler) {
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 
+	// Per-instance last-known-good service list. A transient fetch failure for
+	// one instance preserves its previous routes rather than removing them.
+	cache := make(map[string][]StouterService, len(p.instances))
+
 	var lastHash string
 
-	// Poll immediately on start, then on each tick.
 	for {
-		services, err := fetchServices(p.httpClient, p.endpoint)
-		if err != nil {
-			log.Printf("[stouter] failed to fetch services: %v", err)
-		} else {
-			cfg := buildDynamicConfig(services, p.ruleTpl, p.entryPoints, p.certResolver)
-			hash := hashConfig(cfg)
-			if hash != lastHash {
-				var msg json.Marshaler = cfg
-				select {
-				case cfgChan <- msg:
-					lastHash = hash
-				case <-ctx.Done():
-					return
-				}
+		p.refreshAll(cache)
+
+		cfg := buildDynamicConfig(p.instances, cache)
+		hash := hashConfig(cfg)
+		if hash != lastHash {
+			var msg json.Marshaler = cfg
+			select {
+			case cfgChan <- msg:
+				lastHash = hash
+			case <-ctx.Done():
+				return
 			}
 		}
 
@@ -219,6 +279,37 @@ func (p *Provider) poll(ctx context.Context, cfgChan chan<- json.Marshaler) {
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// refreshAll fetches every instance in parallel and updates cache in place.
+// Failed fetches leave the previous cache entry untouched.
+func (p *Provider) refreshAll(cache map[string][]StouterService) {
+	type result struct {
+		name     string
+		services []StouterService
+		err      error
+	}
+
+	results := make(chan result, len(p.instances))
+	var wg sync.WaitGroup
+	for _, inst := range p.instances {
+		wg.Add(1)
+		go func(inst instance) {
+			defer wg.Done()
+			svcs, err := fetchServices(p.httpClient, inst.endpoint)
+			results <- result{name: inst.name, services: svcs, err: err}
+		}(inst)
+	}
+	wg.Wait()
+	close(results)
+
+	for r := range results {
+		if r.err != nil {
+			log.Printf("[stouter] instance %q: failed to fetch services: %v", r.name, r.err)
+			continue
+		}
+		cache[r.name] = r.services
 	}
 }
 
@@ -252,53 +343,61 @@ func fetchServices(client *http.Client, endpoint string) ([]StouterService, erro
 	return services, nil
 }
 
-// buildDynamicConfig maps a slice of stouter services to a Traefik dynamic
-// configuration with one router and one service per stouter service.
-func buildDynamicConfig(services []StouterService, ruleTpl *template.Template, entryPoints []string, certResolver string) *DynConfig {
-	routers := make(map[string]*Router, len(services))
-	svcMap := make(map[string]*Service, len(services))
+// buildDynamicConfig produces a Traefik dynamic configuration containing the
+// union of routers/services across all instances. Keys are namespaced by
+// instance name as `stouter-{instance}-{service}` to avoid collisions when
+// two instances expose a service with the same name.
+func buildDynamicConfig(instances []instance, cache map[string][]StouterService) *DynConfig {
+	routers := make(map[string]*Router)
+	svcMap := make(map[string]*Service)
 
-	for _, svc := range services {
-		key := "stouter-" + svc.Name
-
-		var rule string
-		if len(svc.Domains) > 0 {
-			parts := make([]string, len(svc.Domains))
-			for i, d := range svc.Domains {
-				parts[i] = fmt.Sprintf("Host(`%s`)", d)
-			}
-			rule = strings.Join(parts, " || ")
-		} else {
-			var ruleBuf bytes.Buffer
-			if err := ruleTpl.Execute(&ruleBuf, svc); err != nil {
-				log.Printf("[stouter] rule template error for %q: %v", svc.Name, err)
-				continue
-			}
-			rule = ruleBuf.String()
+	for _, inst := range instances {
+		services, ok := cache[inst.name]
+		if !ok {
+			continue
 		}
+		for _, svc := range services {
+			key := "stouter-" + inst.name + "-" + svc.Name
 
-		tls := &RouterTLS{CertResolver: certResolver}
-		if len(svc.Domains) > 0 {
-			d := Domain{Main: svc.Domains[0]}
-			if len(svc.Domains) > 1 {
-				d.SANs = append([]string(nil), svc.Domains[1:]...)
+			var rule string
+			if len(svc.Domains) > 0 {
+				parts := make([]string, len(svc.Domains))
+				for i, d := range svc.Domains {
+					parts[i] = fmt.Sprintf("Host(`%s`)", d)
+				}
+				rule = strings.Join(parts, " || ")
+			} else {
+				var ruleBuf bytes.Buffer
+				if err := inst.ruleTpl.Execute(&ruleBuf, svc); err != nil {
+					log.Printf("[stouter] instance %q: rule template error for %q: %v", inst.name, svc.Name, err)
+					continue
+				}
+				rule = ruleBuf.String()
 			}
-			tls.Domains = []Domain{d}
-		}
 
-		routers[key] = &Router{
-			Rule:        rule,
-			Service:     key,
-			EntryPoints: entryPoints,
-			TLS:         tls,
-		}
+			tls := &RouterTLS{CertResolver: inst.certResolver}
+			if len(svc.Domains) > 0 {
+				d := Domain{Main: svc.Domains[0]}
+				if len(svc.Domains) > 1 {
+					d.SANs = append([]string(nil), svc.Domains[1:]...)
+				}
+				tls.Domains = []Domain{d}
+			}
 
-		svcMap[key] = &Service{
-			LoadBalancer: &LoadBalancer{
-				Servers: []Server{
-					{URL: fmt.Sprintf("http://%s", svc.Address)},
+			routers[key] = &Router{
+				Rule:        rule,
+				Service:     key,
+				EntryPoints: inst.entryPoints,
+				TLS:         tls,
+			}
+
+			svcMap[key] = &Service{
+				LoadBalancer: &LoadBalancer{
+					Servers: []Server{
+						{URL: fmt.Sprintf("http://%s", svc.Address)},
+					},
 				},
-			},
+			}
 		}
 	}
 
