@@ -786,6 +786,64 @@ func TestMarshalRouterTLSDomains(t *testing.T) {
 	}
 }
 
+// TestBuildDynamicConfigMetaScheme verifies that a service with a
+// `traefik.scheme` meta entry produces a server URL with that scheme,
+// while services without it default to http.
+func TestBuildDynamicConfigMetaScheme(t *testing.T) {
+	insts := singleInstance("default", "Host(`{{ .Name }}.stouter.local`)", []string{"web"}, "acme")
+	cache := map[string][]StouterService{
+		"default": {
+			{Name: "grpc", Port: 50051, Address: "127.0.0.1:50051", Meta: map[string]string{"traefik.scheme": "h2c"}},
+			{Name: "plain", Port: 8080, Address: "127.0.0.1:8080"},
+			{Name: "empty-scheme", Port: 9090, Address: "127.0.0.1:9090", Meta: map[string]string{"traefik.scheme": ""}},
+		},
+	}
+
+	cfg := buildDynamicConfig(insts, cache)
+
+	got := cfg.HTTP.Services["stouter-default-grpc"].LoadBalancer.Servers[0].URL
+	if got != "h2c://127.0.0.1:50051" {
+		t.Errorf("grpc URL = %q, want %q", got, "h2c://127.0.0.1:50051")
+	}
+
+	got = cfg.HTTP.Services["stouter-default-plain"].LoadBalancer.Servers[0].URL
+	if got != "http://127.0.0.1:8080" {
+		t.Errorf("plain URL = %q, want %q", got, "http://127.0.0.1:8080")
+	}
+
+	got = cfg.HTTP.Services["stouter-default-empty-scheme"].LoadBalancer.Servers[0].URL
+	if got != "http://127.0.0.1:9090" {
+		t.Errorf("empty-scheme URL = %q, want %q", got, "http://127.0.0.1:9090")
+	}
+}
+
+// TestFetchServicesWithMeta verifies the JSON shape with meta round-trips
+// through fetchServices.
+func TestFetchServicesWithMeta(t *testing.T) {
+	body := `[{"name":"grpc","port":50051,"address":"127.0.0.1:50051","meta":{"traefik.scheme":"h2c"}}]`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/services" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	services, err := fetchServices(http.DefaultClient, srv.URL)
+	if err != nil {
+		t.Fatalf("fetchServices: %v", err)
+	}
+	if len(services) != 1 {
+		t.Fatalf("got %d services, want 1", len(services))
+	}
+	if services[0].Meta["traefik.scheme"] != "h2c" {
+		t.Errorf("meta[traefik.scheme] = %q, want %q", services[0].Meta["traefik.scheme"], "h2c")
+	}
+}
+
 // Verify hashConfig returns a stable value for nil input.
 func TestHashConfigNil(t *testing.T) {
 	h := hashConfig(nil)

@@ -63,11 +63,16 @@ func CreateConfig() *Config {
 
 // StouterService represents a single service returned by the stouter API.
 type StouterService struct {
-	Name    string   `json:"name"`
-	Port    int      `json:"port"`
-	Address string   `json:"address"`
-	Domains []string `json:"domains"`
+	Name    string            `json:"name"`
+	Port    int               `json:"port"`
+	Address string            `json:"address"`
+	Domains []string          `json:"domains"`
+	Meta    map[string]string `json:"meta"`
 }
+
+// metaSchemeKey is the meta key consulted to override the URL scheme used
+// when proxying to a service (e.g. "h2c" for gRPC backends).
+const metaSchemeKey = "traefik.scheme"
 
 // ---------------------------------------------------------------------------
 // Traefik dynamic configuration types
@@ -391,10 +396,15 @@ func buildDynamicConfig(instances []instance, cache map[string][]StouterService)
 				TLS:         tls,
 			}
 
+			scheme := "http"
+			if s := svc.Meta[metaSchemeKey]; s != "" {
+				scheme = s
+			}
+
 			svcMap[key] = &Service{
 				LoadBalancer: &LoadBalancer{
 					Servers: []Server{
-						{URL: fmt.Sprintf("http://%s", svc.Address)},
+						{URL: fmt.Sprintf("%s://%s", scheme, svc.Address)},
 					},
 				},
 			}
